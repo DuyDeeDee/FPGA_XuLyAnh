@@ -1,0 +1,577 @@
+`timescale 1ns / 1ps
+// =============================================================================
+// MODULE: camera_interface (FIXED v2)
+//
+// BUG FIXED SO FAR (từ lần sửa trước):
+//   [FIX 1] initial block → Combinational ROM (synthesizable)
+//   [FIX 2] cmos_xclk 50MHz → 25MHz divider
+//   [FIX 3] I2C timeout để tránh treo
+//
+// BUG FIXED MỚI:
+//   [FIX 9] Startup delay quá ngắn (0.66ms thay vì ~670ms)
+//           Điều kiện delay dài bit[26] check `state_q==start_sccb` nhưng
+//           khi ở trạng thái `idle`, state_q là `idle` (=0), không phải
+//           `start_sccb` (=1), nên điều kiện bit[26] không bao giờ đúng
+//           trong lúc khởi động. Kết quả: camera nhận SCCB chỉ sau 0.66ms
+//           thay vì chờ 670ms. Sửa: trong state idle, chờ bit[26] (~670ms).
+// =============================================================================
+
+module camera_interface(
+    input  wire        clk,       // 25MHz (không dùng trong FSM; xclk dùng clk_100)
+    input  wire        clk_100,   // 100MHz - toàn bộ FSM chạy ở đây
+    input  wire        rst_n,
+    input  wire [3:0]  key,       // key[1:0]: brightness, key[3:2]: contrast
+
+    // Async FIFO IO
+    input  wire        rd_en,
+    output wire [9:0]  data_count_r,
+    output wire [15:0] dout,
+
+    // Camera pinouts
+    input  wire        cmos_pclk, cmos_href, cmos_vsync,
+    input  wire [7:0]  cmos_db,
+    inout              cmos_sda, cmos_scl,
+    output wire        cmos_rst_n, cmos_pwdn, cmos_xclk,
+
+    // Debugging
+    output wire [3:0]  led
+);
+
+// FSM states
+localparam idle         = 4'd0,
+           start_sccb   = 4'd1,
+           write_address= 4'd2,
+           write_data   = 4'd3,
+           digest_loop  = 4'd4,
+           delay        = 4'd5,
+           vsync_fedge  = 4'd6,
+           byte1        = 4'd7,
+           byte2        = 4'd8,
+           fifo_write   = 4'd9;
+
+localparam wait_init    = 3'd0,
+           sccb_idle    = 3'd1,
+           sccb_address = 3'd2,
+           sccb_data    = 3'd3,
+           sccb_stop    = 3'd4;
+
+localparam MSG_INDEX = 7'd77;
+
+// =============================================================================
+// [FIX 2] XCLK DIVIDER: clk_100 (100MHz) / 4 = 25MHz
+// OV7670 spec: 10~48MHz, typ 24MHz → 25MHz là hợp lệ
+// =============================================================================
+reg [1:0] xclk_div = 2'b00;
+always @(posedge clk_100 or negedge rst_n) begin
+    if (!rst_n) xclk_div <= 2'b00;
+    else        xclk_div <= xclk_div + 1'b1;
+end
+assign cmos_xclk = xclk_div[1];
+
+// =============================================================================
+// [FIX 1] SYNTHESIZABLE ROM
+// =============================================================================
+reg [6:0]  message_index_q = 7'd0, message_index_d;
+reg [15:0] rom_data;
+always @* begin
+    case (message_index_q)
+        7'd0:  rom_data = 16'h12_80;
+        7'd1:  rom_data = 16'h12_04;
+        7'd2:  rom_data = 16'h15_20;
+        7'd3:  rom_data = 16'h40_d0;
+        7'd4:  rom_data = 16'h12_04;
+        7'd5:  rom_data = 16'h11_80;
+        7'd6:  rom_data = 16'h0C_00;
+        7'd7:  rom_data = 16'h3E_00;
+        7'd8:  rom_data = 16'h04_00;
+        7'd9:  rom_data = 16'h40_d0;
+        7'd10: rom_data = 16'h3a_04;
+        7'd11: rom_data = 16'h14_18;
+        7'd12: rom_data = 16'h4F_B3;
+        7'd13: rom_data = 16'h50_B3;
+        7'd14: rom_data = 16'h51_00;
+        7'd15: rom_data = 16'h52_3d;
+        7'd16: rom_data = 16'h53_A7;
+        7'd17: rom_data = 16'h54_E4;
+        7'd18: rom_data = 16'h58_9E;
+        7'd19: rom_data = 16'h3D_C0;
+        7'd20: rom_data = 16'h17_14;
+        7'd21: rom_data = 16'h18_02;
+        7'd22: rom_data = 16'h32_80;
+        7'd23: rom_data = 16'h19_03;
+        7'd24: rom_data = 16'h1A_7B;
+        7'd25: rom_data = 16'h03_0A;
+        7'd26: rom_data = 16'h0F_41;
+        7'd27: rom_data = 16'h1E_00;
+        7'd28: rom_data = 16'h33_0B;
+        7'd29: rom_data = 16'h3C_78;
+        7'd30: rom_data = 16'h69_00;
+        7'd31: rom_data = 16'h74_00;
+        7'd32: rom_data = 16'hB0_84;
+        7'd33: rom_data = 16'hB1_0c;
+        7'd34: rom_data = 16'hB2_0e;
+        7'd35: rom_data = 16'hB3_80;
+        7'd36: rom_data = 16'h70_3a;
+        7'd37: rom_data = 16'h71_35;
+        7'd38: rom_data = 16'h72_11;
+        7'd39: rom_data = 16'h73_f0;
+        7'd40: rom_data = 16'ha2_02;
+        7'd41: rom_data = 16'h7a_20;
+        7'd42: rom_data = 16'h7b_10;
+        7'd43: rom_data = 16'h7c_1e;
+        7'd44: rom_data = 16'h7d_35;
+        7'd45: rom_data = 16'h7e_5a;
+        7'd46: rom_data = 16'h7f_69;
+        7'd47: rom_data = 16'h80_76;
+        7'd48: rom_data = 16'h81_80;
+        7'd49: rom_data = 16'h82_88;
+        7'd50: rom_data = 16'h83_8f;
+        7'd51: rom_data = 16'h84_96;
+        7'd52: rom_data = 16'h85_a3;
+        7'd53: rom_data = 16'h86_af;
+        7'd54: rom_data = 16'h87_c4;
+        7'd55: rom_data = 16'h88_d7;
+        7'd56: rom_data = 16'h89_e8;
+        7'd57: rom_data = 16'h13_e0;
+        7'd58: rom_data = 16'h00_00;
+        7'd59: rom_data = 16'h10_00;
+        7'd60: rom_data = 16'h0d_40;
+        7'd61: rom_data = 16'h14_18;
+        7'd62: rom_data = 16'ha5_05;
+        7'd63: rom_data = 16'hab_07;
+        7'd64: rom_data = 16'h24_95;
+        7'd65: rom_data = 16'h25_33;
+        7'd66: rom_data = 16'h26_e3;
+        7'd67: rom_data = 16'h9f_78;
+        7'd68: rom_data = 16'ha0_68;
+        7'd69: rom_data = 16'ha1_03;
+        7'd70: rom_data = 16'ha6_d8;
+        7'd71: rom_data = 16'ha7_d8;
+        7'd72: rom_data = 16'ha8_f0;
+        7'd73: rom_data = 16'ha9_90;
+        7'd74: rom_data = 16'haa_94;
+        7'd75: rom_data = 16'h13_e5;
+        7'd76: rom_data = 16'h1E_23;
+        7'd77: rom_data = 16'h69_06;
+        default: rom_data = 16'h00_00;
+    endcase
+end
+
+// =============================================================================
+// REGISTERS
+// =============================================================================
+reg [3:0]  state_q = 4'd0, state_d;
+reg [2:0]  sccb_state_q = 3'd0, sccb_state_d;
+reg [7:0]  addr_q, addr_d;
+reg [7:0]  data_q, data_d;
+reg [7:0]  brightness_q, brightness_d;
+reg [7:0]  contrast_q, contrast_d;
+reg        start, stop;
+reg [7:0]  wr_data;
+wire       rd_tick;
+wire [1:0] ack;
+wire [7:0] rd_data;
+wire [3:0] i2c_state;
+reg [3:0]  led_q = 4'd0, led_d;
+reg [27:0] delay_q = 28'd0, delay_d;
+reg        start_delay_q = 1'b0, start_delay_d;
+reg        delay_finish;
+reg [15:0] pixel_q, pixel_d;
+reg        wr_en;
+wire       full;
+wire       key0_tick, key1_tick, key2_tick, key3_tick;
+
+// [FIX 3] I2C timeout
+reg [19:0] sccb_timeout_q = 20'd0, sccb_timeout_d;
+reg        sccb_timeout_hit;
+
+// 2-stage input buffer (metastability protection)
+reg pclk_1, pclk_2, href_1, href_2, vsync_1, vsync_2;
+
+// =============================================================================
+// REGISTER UPDATE
+// =============================================================================
+always @(posedge clk_100 or negedge rst_n) begin
+    if (!rst_n) begin
+        state_q         <= 4'd0;
+        led_q           <= 4'd0;
+        delay_q         <= 28'd0;
+        start_delay_q   <= 1'b0;
+        message_index_q <= 7'd0;
+        pixel_q         <= 16'd0;
+        sccb_state_q    <= 3'd0;
+        addr_q          <= 8'd0;
+        data_q          <= 8'd0;
+        brightness_q    <= 8'd0;
+        contrast_q      <= 8'd0;
+        sccb_timeout_q  <= 20'd0;
+        pclk_1  <= 1'b0; pclk_2  <= 1'b0;
+        href_1  <= 1'b0; href_2  <= 1'b0;
+        vsync_1 <= 1'b0; vsync_2 <= 1'b0;
+    end
+    else begin
+        state_q         <= state_d;
+        led_q           <= led_d;
+        delay_q         <= delay_d;
+        start_delay_q   <= start_delay_d;
+        message_index_q <= message_index_d;
+        pixel_q         <= pixel_d;
+        sccb_state_q    <= sccb_state_d;
+        addr_q          <= addr_d;
+        data_q          <= data_d;
+        brightness_q    <= brightness_d;
+        contrast_q      <= contrast_d;
+        sccb_timeout_q  <= sccb_timeout_d;
+        pclk_1  <= cmos_pclk;  pclk_2  <= pclk_1;
+        href_1  <= cmos_href;  href_2  <= href_1;
+        vsync_1 <= cmos_vsync; vsync_2 <= vsync_1;
+    end
+end
+
+// =============================================================================
+// COMBINATIONAL LOGIC
+// =============================================================================
+always @* begin
+    state_d          = state_q;
+    led_d            = led_q;
+    start            = 1'b0;
+    stop             = 1'b0;
+    wr_data          = 8'd0;
+    start_delay_d    = start_delay_q;
+    delay_d          = delay_q;
+    delay_finish     = 1'b0;
+    message_index_d  = message_index_q;
+    pixel_d          = pixel_q;
+    wr_en            = 1'b0;
+    sccb_state_d     = sccb_state_q;
+    addr_d           = addr_q;
+    data_d           = data_q;
+    brightness_d     = brightness_q;
+    contrast_d       = contrast_q;
+    sccb_timeout_d   = sccb_timeout_q;
+    sccb_timeout_hit = 1'b0;
+
+    // [FIX 3] SCCB TIMEOUT
+    if (sccb_state_q == sccb_address ||
+        sccb_state_q == sccb_data    ||
+        sccb_state_q == sccb_stop) begin
+        sccb_timeout_d = sccb_timeout_q + 1'b1;
+        if (sccb_timeout_q == 20'hFFFFF) begin
+            sccb_timeout_hit = 1'b1;
+            sccb_timeout_d   = 20'd0;
+        end
+    end
+    else begin
+        sccb_timeout_d = 20'd0;
+    end
+
+    // DELAY COUNTER
+    if (start_delay_q) delay_d = delay_q + 1'b1;
+
+    // Short delay (~0.66ms): chỉ dùng GIỮA các lần ghi SCCB
+    // PHẢI loại trừ state idle, nếu không counter bị reset mỗi 0.66ms
+    // → không bao giờ tích lũy đủ đến bit[26] → LED 0001 mãi mãi
+    if (delay_q[16] && message_index_q != (MSG_INDEX + 1'b1)
+                    && state_q != start_sccb
+                    && state_q != idle) begin
+        delay_finish  = 1'b1;
+        start_delay_d = 1'b0;
+        delay_d       = 28'd0;
+    end
+    // Long delay (~670ms): sau khi ghi xong tất cả register
+    else if (delay_q[26] && message_index_q == (MSG_INDEX + 1'b1)) begin
+        delay_finish  = 1'b1;
+        start_delay_d = 1'b0;
+        delay_d       = 28'd0;
+    end
+
+    // =========================================================================
+    // FSM CHÍNH
+    // =========================================================================
+    case (state_q)
+
+        // [FIX 9] Dùng bit[26] (~670ms) thay vì bit[16] (0.66ms) để chờ
+        // camera OV7670 khởi động đủ thời gian trước khi nhận SCCB
+        idle: begin
+            if (delay_q[26]) begin
+                state_d       = start_sccb;
+                start_delay_d = 1'b0;
+                delay_d       = 28'd0;
+            end
+            else start_delay_d = 1'b1;
+        end
+
+        start_sccb: begin
+            start   = 1'b1;
+            wr_data = 8'h42;   // SCCB write address OV7670 = 0x42
+            state_d = write_address;
+        end
+
+        // QUAN TRỌNG: dùng ack[1] thay vì ack==2'b11
+        // SCCB (OV7670) khác I2C chuẩn:
+        //   Byte 1 (slave addr): camera kéo SDA xuống → ack=2'b11 OK
+        //   Byte 2 (reg addr)  : camera kéo SDA xuống → ack=2'b11 OK
+        //   Byte 3 (data byte) : camera KHÔNG kéo SDA (don't-care bit)
+        //     → SDA nổi = 1 → ack[0]=0 → ack=2'b10, không bao giờ =2'b11
+        //     → FSM kẹt mãi ở write_data và digest_loop → LED 0011 mãi
+        // Fix: chỉ cần ack[1] (pulse tại bit thứ 9), bỏ qua ACK/NACK value
+        write_address: begin
+            if (ack[1]) begin
+                wr_data = rom_data[15:8];
+                state_d = write_data;
+            end
+            else if (sccb_timeout_hit) begin
+                stop    = 1'b1;
+                state_d = start_sccb;  // thử lại từ đầu
+            end
+        end
+
+        write_data: begin
+            if (ack[1]) begin
+                wr_data = rom_data[7:0];
+                state_d = digest_loop;
+            end
+            else if (sccb_timeout_hit) begin
+                stop    = 1'b1;
+                state_d = start_sccb;
+            end
+        end
+
+        digest_loop: begin
+            if (ack[1]) begin          // byte 3: don't-care bit → chỉ cần pulse
+                stop            = 1'b1;
+                start_delay_d   = 1'b1;
+                message_index_d = message_index_q + 1'b1;
+                state_d         = delay;
+            end
+            else if (sccb_timeout_hit) begin
+                stop    = 1'b1;
+                state_d = start_sccb;
+            end
+        end
+
+        delay: begin
+            if (message_index_q == (MSG_INDEX + 1'b1) && delay_finish) begin
+                state_d = vsync_fedge;
+            // [LED_DEBUG_REMOVED] led_d   = 4'b0110;
+            end
+            else if (i2c_state == 4'd0 && delay_finish)
+                state_d = start_sccb;
+        end
+
+        vsync_fedge: begin
+            if (vsync_1 == 1'b0 && vsync_2 == 1'b1)
+                state_d = byte1;
+        end
+
+        byte1: begin
+            if (pclk_1 && !pclk_2 && href_1 && href_2) begin
+                pixel_d[15:8] = cmos_db;
+                state_d       = byte2;
+            end
+            else if (vsync_1 && vsync_2)
+                state_d = vsync_fedge;
+        end
+
+        byte2: begin
+            if (pclk_1 && !pclk_2 && href_1 && href_2) begin
+                pixel_d[7:0] = cmos_db;
+                state_d      = fifo_write;
+            end
+            else if (vsync_1 && vsync_2)
+                state_d = vsync_fedge;
+        end
+
+        fifo_write: begin
+            wr_en   = 1'b1;
+            state_d = byte1;
+            // [LED_DEBUG_REMOVED] if (full) led_d = 4'b1001;
+        end
+
+        default: state_d = idle;
+
+    endcase
+
+    // =========================================================================
+    // FSM PHỤ: Brightness / Contrast
+    // =========================================================================
+    case (sccb_state_q)
+
+        wait_init: begin
+            if (state_q == byte1) begin
+                sccb_state_d = sccb_idle;
+                addr_d       = 8'd0;
+                data_d       = 8'd0;
+                brightness_d = 8'h00;
+                contrast_d   = 8'h40;
+            end
+        end
+
+        sccb_idle: begin
+            if (i2c_state == 4'd0) begin
+                if (key0_tick) begin
+                    brightness_d = brightness_q[7] ? brightness_q - 1'b1 : brightness_q + 1'b1;
+                    if (brightness_q == 8'h80) brightness_d = 8'h00;
+                    start = 1'b1; wr_data = 8'h42;
+                    addr_d = 8'h55; data_d = brightness_d;
+                    sccb_state_d = sccb_address; // led handled by led_debug block
+                end
+                if (key1_tick) begin
+                    brightness_d = brightness_q[7] ? brightness_q + 1'b1 : brightness_q - 1'b1;
+                    if (brightness_q == 8'h00) brightness_d = 8'h80;
+                    start = 1'b1; wr_data = 8'h42;
+                    addr_d = 8'h55; data_d = brightness_d;
+                    sccb_state_d = sccb_address; // led handled by led_debug block
+                end
+                else if (key2_tick) begin
+                    contrast_d = contrast_q + 1'b1;
+                    start = 1'b1; wr_data = 8'h42;
+                    addr_d = 8'h56; data_d = contrast_d;
+                    sccb_state_d = sccb_address; // led handled by led_debug block
+                end
+                else if (key3_tick) begin
+                    contrast_d = contrast_q - 1'b1;
+                    start = 1'b1; wr_data = 8'h42;
+                    addr_d = 8'h56; data_d = contrast_d;
+                    sccb_state_d = sccb_address; // led handled by led_debug block
+                end
+            end
+        end
+
+        sccb_address: begin
+            if (sccb_timeout_hit) begin
+                sccb_state_d = sccb_idle; // led handled by led_debug block
+            end
+            else if (ack[1]) begin
+                wr_data = addr_q; sccb_state_d = sccb_data;
+            end
+        end
+
+        sccb_data: begin
+            if (sccb_timeout_hit) begin
+                sccb_state_d = sccb_idle; // led handled by led_debug block
+            end
+            else if (ack[1]) begin
+                wr_data = data_q; sccb_state_d = sccb_stop;
+            end
+        end
+
+        sccb_stop: begin
+            if (sccb_timeout_hit) begin
+                sccb_state_d = sccb_idle; // led handled by led_debug block
+            end
+            else if (ack[1]) begin
+                stop = 1'b1; sccb_state_d = sccb_idle; // led handled by led_debug block
+            end
+        end
+
+        default: sccb_state_d = wait_init;
+
+    endcase
+end
+
+assign cmos_pwdn  = 1'b0;
+assign cmos_rst_n = 1'b1;
+
+// =============================================================================
+// LED DEBUG - Luôn hiển thị đúng state thực tế, không bị overwrite bởi FSM
+// =============================================================================
+// BLINK generator: dùng bit[23] của counter → nhấp nháy ~6Hz @ 100MHz
+reg [23:0] blink_ctr = 24'd0;
+always @(posedge clk_100 or negedge rst_n) begin
+    if (!rst_n) blink_ctr <= 24'd0;
+    else        blink_ctr <= blink_ctr + 1'b1;
+end
+wire blink_fast = blink_ctr[22]; // ~12Hz
+wire blink_slow = blink_ctr[23]; // ~6Hz
+
+// I2C timeout sticky flag - giữ lại để người dùng thấy kịp
+reg i2c_timeout_sticky = 1'b0;
+always @(posedge clk_100 or negedge rst_n) begin
+    if (!rst_n)              i2c_timeout_sticky <= 1'b0;
+    else if (sccb_timeout_hit) i2c_timeout_sticky <= 1'b1;
+    // Reset sticky khi nhấn key bất kỳ
+    else if (key0_tick | key1_tick | key2_tick | key3_tick)
+                             i2c_timeout_sticky <= 1'b0;
+end
+
+// FIFO full sticky
+reg fifo_full_sticky = 1'b0;
+always @(posedge clk_100 or negedge rst_n) begin
+    if (!rst_n) fifo_full_sticky <= 1'b0;
+    else if (full) fifo_full_sticky <= 1'b1;
+end
+
+reg [3:0] led_debug;
+always @* begin
+    //  LED[3] LED[2] LED[1] LED[0]
+    //  --------------------------------
+    //  0      0      0      1   = 0001 → Power ON, chờ startup delay (idle)
+    //  0      0      1      0   = 0010 → Đang gửi SCCB lần đầu (start_sccb)
+    //  0      0      1      1   = 0011 → Đang ghi thanh ghi (write_address/write_data/digest_loop)
+    //  0      1      0      1   = 0101 → Delay giữa các lần ghi SCCB
+    //  0      1      1      0   = 0110 → ✅ Init XONG, chờ VSYNC từ camera
+    //  0      1      1      1   = 0111 → ✅ Đang nhận pixel (byte1/byte2)
+    //  1      0      0      0   = 1000 → Đang ghi FIFO (fifo_write)
+    //  1      0      0      1   = 1001 → ⚠ FIFO đã từng FULL (overflow cảnh báo)
+    //  1      0      1      0   = 1010 → ❌ I2C TIMEOUT - SCCB không nhận ACK
+    //  1      1      1      1   = 1111 → ❌ Unknown state
+
+    casex ({i2c_timeout_sticky, state_q})
+        // Ưu tiên cao nhất: I2C timeout (nhấp nháy nhanh để phân biệt)
+        5'b1_xxxx: led_debug = {blink_fast, 1'b0, blink_fast, 1'b0}; // 1010 nhấp nháy
+
+        // Các state bình thường
+        5'b0_0000: led_debug = 4'b0001; // idle: chờ startup
+        5'b0_0001: led_debug = 4'b0010; // start_sccb
+        5'b0_0010: led_debug = 4'b0011; // write_address  } nhấp nháy
+        5'b0_0011: led_debug = {2'b00, blink_fast, 1'b1}; // write_data
+        5'b0_0100: led_debug = {2'b00, blink_slow, 1'b1}; // digest_loop
+        5'b0_0101: led_debug = 4'b0101; // delay giữa SCCB
+        5'b0_0110: led_debug = {blink_slow, 1'b1, blink_slow, 1'b0}; // vsync_fedge: nhấp nháy chờ
+        5'b0_0111: led_debug = 4'b0111; // byte1: đang capture
+        5'b0_1000: led_debug = 4'b0111; // byte2: đang capture
+        5'b0_1001: led_debug = fifo_full_sticky ? 4'b1001 : 4'b1000; // fifo_write
+        default:   led_debug = 4'b1111; // unknown
+    endcase
+end
+
+assign led = led_debug;
+
+// I2C / SCCB controller
+i2c_top #(.freq(100_000)) m0 (
+    .clk     (clk_100),
+    .rst_n   (rst_n),
+    .start   (start),
+    .stop    (stop),
+    .wr_data (wr_data),
+    .rd_tick (rd_tick),
+    .ack     (ack),
+    .rd_data (rd_data),
+    .scl     (cmos_scl),
+    .sda     (cmos_sda),
+    .state   (i2c_state)
+);
+
+// Camera pixel FIFO
+fifo m2 (
+    .aclr    (~rst_n),
+    .data    (pixel_q),
+    .rdclk   (clk_100),
+    .rdreq   (rd_en),
+    .wrclk   (clk_100),
+    .wrreq   (wr_en),
+    .q       (dout),
+    .rdempty (),
+    .rdusedw (data_count_r),
+    .wrfull  (full),
+    .wrusedw ()
+);
+
+// Debounce
+debounce_explicit m3 (.clk(clk_100),.rst_n(rst_n),.sw(!key[0]),.db_level(),.db_tick(key0_tick));
+debounce_explicit m4 (.clk(clk_100),.rst_n(rst_n),.sw(!key[1]),.db_level(),.db_tick(key1_tick));
+debounce_explicit m5 (.clk(clk_100),.rst_n(rst_n),.sw(!key[2]),.db_level(),.db_tick(key2_tick));
+debounce_explicit m6 (.clk(clk_100),.rst_n(rst_n),.sw(!key[3]),.db_level(),.db_tick(key3_tick));
+
+endmodule
